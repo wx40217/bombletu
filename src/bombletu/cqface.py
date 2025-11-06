@@ -1,5 +1,5 @@
-# https://bot.q.qq.com/wiki/develop/pythonsdk/model/emoji.html
-# https://github.com/zhullyb/cq-code-face-table
+"""QQ 表情名称映射。"""
+
 CQFACE = {
     0: "惊讶",
     1: "撇嘴",
