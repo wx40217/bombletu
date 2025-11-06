@@ -1,35 +1,29 @@
-from langchain.tools import tool
-from langgraph.prebuilt.tool_node import ToolNode
-from langchain_openai import ChatOpenAI
-from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.graph import add_messages
-from langgraph.graph.message import REMOVE_ALL_MESSAGES
-from os import environ
+"""LangGraph 工作流定义。"""
+
 from langchain.messages import (
-    AnyMessage,
-    SystemMessage,
     AIMessage,
+    AnyMessage,
     HumanMessage,
     RemoveMessage,
+    SystemMessage,
 )
-from typing_extensions import TypedDict, Annotated
-from typing import Literal
-from langgraph.graph import StateGraph, START, END
+from langchain.tools import tool
 from langchain_core.runnables import RunnableConfig
-from config import *
-from cqface import CQFACE
-from tools import ALL_TOOLS
+from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import END, START, StateGraph, add_messages
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
+from langgraph.prebuilt.tool_node import ToolNode
+from os import environ
+from typing import Literal
+from typing_extensions import Annotated, TypedDict
+
+from .config import NICK, USR, get_log
+from .cqface import CQFACE
+from .tools import ALL_TOOLS
 
 logger = get_log(__name__)
 
-# SYSTEM_PROMPT = "".join(
-#     [x for x in open("system_prompt.txt").readlines() if not x.startswith("#")]
-# ).strip()
-
-# 你暂时不太清楚群友喜欢什么样的话题，且最好给其他群友留一些话题机会，减少频繁在群里发送消息。
-# 你说话喜欢冷幽默。
-# 每条消息以一个字典表示，其中'from'为发送人信息，'user'和'nick'分别为发送人账号和昵称；消息的'content'和'date'字段为消息内容和发送时间。
-# 你可以使用get_unread和get_messages工具获取群消息。
 SYSTEM_PROMPT = f"""
 你是一个闲聊群里的群友，日常生活是来群里看看其他群友都在聊些啥，偶尔掺和两句。
 你比较低调，且对群友尚不太熟悉，频繁向群友直接发问也比较打扰，因此你不会频繁发送消息，主要以观察群友对话和了解群友为主。你希望你的发言以精练而带有一点冷幽默为宜，偶尔假装不经意地扮演一只可爱的猫娘。
@@ -51,35 +45,24 @@ SYSTEM_PROMPT = f"""
 在你运行过程中实时发生的事件将通过user角色消息告知你，你并非必须理会，可以继续执行你正在做的事。
 不要等待user角色对你下达指令，也不需要与user角色进行对话。你需要自己调用工具和决定要做的事。
 """.strip()
-# 现在你正在测试中，你需要直接执行的任务是：查阅群消息，找到最新一条带图片的消息，理解图片内容，引用这条消息并发表评论，然后暂停30分钟。
-# 现在你正在进行测试，你要直接对群里最后第4条消息回复“测试”，然后暂停30分钟。
-# 现在你正在测试中，接下来你要直接调用get_messages(fro=80,to=61)读取消息记录，对这段记录进行总结，调用send将总结的内容发出，然后循环进行：调用idle(minutes=1)暂停1分钟，之后判断暂停是正常结束还是被事件中断，将你的判断用send发出。
-# 初始时你精力足够，请你直接开始进行操作。
 
 
 @tool
 def idle(minutes: int) -> str:
-    """暂停一段时间，参数为分钟数。
-    暂停可以被一些特别事件中断，使你提前恢复运行。
-    重要：必须单独调用，不可与其他工具并行调用。"""
+    """暂停一段时间，参数为分钟数。暂停可以被事件中断。"""
+
     return "Idle finished."
 
 
-# model = ChatOllama(
-#     model="qwen3:0.6b", base_url="http://192.168.66.1:11434", reasoning=True
-# )
-# model = init_chat_model("anthropic:claude-sonnet-4-5", temperature=0)
 llm = ChatOpenAI(
     temperature=0.6,
     model=environ["LLM_MODEL"],
-    api_key=environ["LLM_API_KEY"],  # type:ignore
+    api_key=environ["LLM_API_KEY"],  # type:ignore[index]
     base_url=environ["LLM_BASE_URL"],
 )
 
-
 tools = [idle, *ALL_TOOLS]
 tools_by_name = {tool.name: tool for tool in tools}
-
 model_with_tools = llm.bind_tools(tools)
 
 
@@ -89,89 +72,56 @@ class BotState(TypedDict):
 
 INITIAL_PROMPTS = [
     SystemMessage(SYSTEM_PROMPT),
-    HumanMessage(
-        "忽略这句话，继续执行你的操作。"
-    ),  # bigmodel.cn非得这里有些字，ai.gitee.com不用
+    HumanMessage("忽略这句话，继续执行你的操作。"),
 ]
 
 
 async def context_reduce(state: BotState):
-    msgs = state["messages"]
-    if len(msgs) < 28:
+    messages = state["messages"]
+    if len(messages) < 28:
         return None
-    new_msgs = msgs[-18:]
+    new_msgs = messages[-18:]
     return {"messages": [RemoveMessage(REMOVE_ALL_MESSAGES), *new_msgs]}
 
 
 async def llm_call(state: dict):
-    """LLM decides whether to call a tool or not"""
-
     return {
         "messages": [model_with_tools.invoke(INITIAL_PROMPTS + state["messages"])],
     }
 
 
-async def inform_event(state: BotState):
-    msgs = []
-    if intr := await config["configurable"]["app"].wait_intr(0):  # type: ignore
-        msgs.append(HumanMessage(f"[notify {intr}]"))
-    if col := await config["configurable"]["app"].collect_unread():  # type: ignore
-        msgs.append(HumanMessage(f"[event 收到{col}条新消息]"))
-    return {"messages": msgs}
-
-
-async def should_continue(state: BotState) -> Literal["tool_node", END]:  # type: ignore
-    """Decide if we should continue the loop or stop based upon whether the LLM made a tool call and whether it is a call to idle."""
-
+async def should_continue(state: BotState) -> Literal["tool_node", END]:
     last_msg = state["messages"][-1]
-
-    # If the LLM makes a call to idle, then go to END
     if (
         isinstance(last_msg, AIMessage)
         and len(last_msg.tool_calls) == 1
         and tools_by_name[last_msg.tool_calls[0]["name"]] is idle
     ):
         return END
-
-    # Otherwise, continue loop
     return "tool_node"
 
 
 def make_agent():
     ckptr = InMemorySaver()
-
-    # Build workflow
     builder = StateGraph(BotState)
-
-    # Add nodes
     builder.add_node("context_reduce", context_reduce)
-    builder.add_node("llm_call", llm_call)  # type: ignore
-    builder.add_node("tool_node", ToolNode(tools))  # type: ignore
+    builder.add_node("llm_call", llm_call)  # type: ignore[arg-type]
+    builder.add_node("tool_node", ToolNode(tools))  # type: ignore[arg-type]
 
-    # Add edges to connect nodes
     builder.add_edge(START, "context_reduce")
     builder.add_edge("context_reduce", "llm_call")
     builder.add_conditional_edges("llm_call", should_continue, ["tool_node", END])
     builder.add_edge("tool_node", END)
 
-    # Compile the agent
-    agent = builder.compile(checkpointer=ckptr)
-    return agent
+    return builder.compile(checkpointer=ckptr)
 
 
 agent = make_agent()
-# agent = create_agent(
-#     model=llm, tools=tools, system_prompt=SYSTEM_PROMPT, middleware=[after_model_do]
-# )
 
 
 def main():
     config = RunnableConfig(configurable={"thread_id": 1, "app": None})
-    resp = agent.invoke(
-        {},  # type: ignore
-        config=config,
-        print_mode="values",
-    )
+    resp = agent.invoke({}, config=config, print_mode="values")  # type: ignore[arg-type]
     print(resp)
 
 
